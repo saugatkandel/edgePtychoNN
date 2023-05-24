@@ -5,7 +5,6 @@ import threading
 import time
 
 import numpy as np
-import psutil
 import pvapy as pva
 from pvapy.hpc.adImageProcessor import AdImageProcessor
 
@@ -48,7 +47,7 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             if not os.path.exists(self.outputDirectory):
                 self.logger.debug(f"Creating output directory: {self.outputDirectory}")
                 os.makedirs(self.outputDirectory)
-            self.outputFileNameFormat = configDict.get("outputFileNameFormat", "{uniqueId:06}.{processorId}.tiff")
+            self.outputFileNameFormat = configDict.get("outputFileNameFormat", "{uniqueId:06}.{processorId}.bl2")
             self.logger.debug(f"Using output file name format: {self.outputFileNameFormat}")
         else:
             self.logger.debug("Not saving output inferences.")
@@ -58,7 +57,7 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             if not os.path.exists(self.inputFileSaveDirectory):
                 self.logger.debug(f"Creating output directory: {self.inputFileSaveDirectory}")
                 os.makedirs(self.inputFileSaveDirectory)
-            self.inputFileNameFormat = configDict.get("inputFileNameFormat", "{uniqueId:06}.{processorId}.tiff")
+            self.inputFileNameFormat = configDict.get("inputFileNameFormat", "{uniqueId:06}.{processorId}.bl2")
             self.logger.debug(f"Using output file name format: {self.inputFileNameFormat}")
         else:
             self.logger.debug("Not saving output inferences.")
@@ -69,13 +68,7 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
         if QUANTIZATION:
             model_name += "_QUANTIZED"
         self.onnx_mdl = configDict.get("onnx_mdl", MODEL_PATHS[model_name])
-        self.logger.debug("Onnx model is {self.onnx_mdl}.")
-
-        # monitoring
-        self.network_interface_to_monitor = configDict.get("net", "")
-        self.m_network_rx_last = 0.0
-        self.m_network_tx_last = 0.0
-
+        print(self.onnx_mdl)
         self.isDone = False
 
     def inferWorker(self):
@@ -86,13 +79,15 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
         import sys
 
         sys.path.insert(0, CURRENT_PATH)
-        from codecAD import CodecAD
-
         from inferPtychoNN import inferPtychoNNtrt
+        from codecAD import CodecAD
+        import blosc2
 
-        # import blosc2
+        # import blosc
+
+        # blosc.set_nthreads(1)
+
         self.codecAD = CodecAD()
-
         self.inferEngine = inferPtychoNNtrt(
             self,
             mbsz=self.bsz,
@@ -132,7 +127,7 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             else:
                 self.codecAD.decompress(data, codec, compressed, uncompressed)
                 decompressed = self.codecAD.getData()
-                # decompressed = blosc2.decompress(data)
+                # decompressed = blosc.decompress(data)
                 image = np.frombuffer(decompressed, dtype=np.float32).reshape((ny, nx))
 
             batch_list.append(image)
@@ -189,15 +184,6 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             self.outputDirectory = outputDirectory
         if "outputFileNameFormat" in configDict:
             self.outputFileNameFormat = configDict.get("outputFileNameFormat")
-        if "inputFileSaveDirectory" in configDict:
-            inputFileSaveDirectory = configDict.get("inputFileSaveDirectory")
-            self.logger.debug(f"Reconfigured input save directory: {inputFileSaveDirectory}")
-            if not os.path.exists(inputFileSaveDirectory):
-                self.logger.debug(f"Creating input save directory: {inputFileSaveDirectory}")
-                os.makedirs(inputFileSaveDirectory)
-            self.inputFileSaveDirectory = inputFileSaveDirectory
-        if "inputFileNameFormat" in configDict:
-            self.inputFileNameFormat = configDict.get("inputFileNameFormat")
 
     def process(self, pvObject):
         if self.isDone:
@@ -221,78 +207,27 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
         self.nFramesProcessed = 0
         self.nBatchesProcessed = 0
         self.inferTime = 0
-        self.m_network_tx_last = 0.0
-        self.m_network_rx_last = 0.0
-
-    def getMetrics(self):
-        m = {}
-        # according to https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
-        # total used memory = RSS + CACHE + (SWAP)
-        # we ingore SWAP as we don't expect to use it
-        with open("/sys/fs/cgroup/memory/memory.stat") as file:
-            cache = 0
-            rss = 0
-            for l in file:
-                sp = l.split(" ")
-                if sp[0] == "cache":
-                    cache = int(sp[1])
-                elif sp[0] == "rss":
-                    rss = int(sp[1])
-            # make it to GB
-            m["memUsed"] = (rss + cache) / 1e9
-        m["cpuUtil"] = float(psutil.cpu_percent())
-        if self.network_interface_to_monitor != "":
-            n = psutil.net_io_counters(pernic=True)
-            if self.network_interface_to_monitor not in n:
-                self.logger.error(f"failed to find network {self.network_interface_to_monitor} to monitor")
-            else:
-                # expected format is
-                # snetio(bytes_sent=8670463628, bytes_recv=7493883175, packets_sent=30910313, packets_recv=20757489, errin=1, errout=0, dropin=0, dropout=0)
-                n_metric = list(n[self.network_interface_to_monitor])
-                # make them to GB
-                tx = n_metric[0] / 1e9
-                rx = n_metric[1] / 1e9
-                # the first measurement skips reporting
-                if self.m_network_rx_last == 0.0:
-                    m["netTxUsed"] = 0.0
-                    m["netRxUsed"] = 0.0
-                    self.m_network_tx_last = tx
-                    self.m_network_rx_last = rx
-                else:
-                    m["netTxUsed"] = tx - self.m_network_tx_last
-                    m["netRxUsed"] = rx - self.m_network_rx_last
-                    self.m_network_tx_last = tx
-                    self.m_network_rx_last = rx
-        return m
 
     # Retrieve statistics for user processor
     def getStats(self):
-        stat = self.getMetrics()
         inferRate = 0
         frameProcessingRate = 0
         if self.nBatchesProcessed > 0:
             inferRate = self.nBatchesProcessed / self.inferTime
             frameProcessingRate = self.nFramesProcessed / self.inferTime
         nFramesQueued = self.tq_frame_q.qsize()
-        stat.update(
-            {
-                "nFramesProcessed": self.nFramesProcessed,
-                "nBatchesProcessed": self.nBatchesProcessed,
-                "nFramesQueued": nFramesQueued,
-                "inferTime": self.inferTime,
-                "inferRate": inferRate,
-                "frameProcessingRate": frameProcessingRate,
-            }
-        )
-        return stat
+        return {
+            "nFramesProcessed": self.nFramesProcessed,
+            "nBatchesProcessed": self.nBatchesProcessed,
+            "nFramesQueued": nFramesQueued,
+            "inferTime": self.inferTime,
+            "inferRate": inferRate,
+            "frameProcessingRate": frameProcessingRate,
+        }
 
     # Define PVA types for different stats variables
     def getStatsPvaTypes(self):
         return {
-            "memUsed": pva.FLOAT,
-            "cpuUtil": pva.FLOAT,
-            "netTxUsed": pva.FLOAT,
-            "netRxUsed": pva.FLOAT,
             "nFramesProcessed": pva.UINT,
             "nBatchesProcessed": pva.UINT,
             "nFramesQueued": pva.UINT,

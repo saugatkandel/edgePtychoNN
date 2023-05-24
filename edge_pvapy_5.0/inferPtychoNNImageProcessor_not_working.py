@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import threading
 import time
 
@@ -41,7 +42,6 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
         self.inferTime = 0
 
         self.outputDirectory = configDict.get("outputDirectory", None)
-        self.inputFileSaveDirectory = configDict.get("inputFileSaveDirectory", None)
 
         if self.outputDirectory is not None:
             self.logger.debug(f"Using output directory: {self.outputDirectory}")
@@ -53,23 +53,13 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
         else:
             self.logger.debug("Not saving output inferences.")
 
-        if self.inputFileSaveDirectory is not None:
-            self.logger.debug(f"Saving input files in directory: {self.inputFileSaveDirectory}")
-            if not os.path.exists(self.inputFileSaveDirectory):
-                self.logger.debug(f"Creating output directory: {self.inputFileSaveDirectory}")
-                os.makedirs(self.inputFileSaveDirectory)
-            self.inputFileNameFormat = configDict.get("inputFileNameFormat", "{uniqueId:06}.{processorId}.tiff")
-            self.logger.debug(f"Using output file name format: {self.inputFileNameFormat}")
-        else:
-            self.logger.debug("Not saving output inferences.")
-
         self.bsz = configDict.get("bsz", BATCH_SIZE)
 
         model_name = f"{MODEL_INPUT_SIZE}"
         if QUANTIZATION:
             model_name += "_QUANTIZED"
         self.onnx_mdl = configDict.get("onnx_mdl", MODEL_PATHS[model_name])
-        self.logger.debug("Onnx model is {self.onnx_mdl}.")
+        print(self.onnx_mdl)
 
         # monitoring
         self.network_interface_to_monitor = configDict.get("net", "")
@@ -90,9 +80,10 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
 
         from inferPtychoNN import inferPtychoNNtrt
 
-        # import blosc2
-        self.codecAD = CodecAD()
+        # import blosc
+        # blosc.set_nthreads(1)
 
+        self.codecAD = CodecAD()
         self.inferEngine = inferPtychoNNtrt(
             self,
             mbsz=self.bsz,
@@ -132,18 +123,15 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             else:
                 self.codecAD.decompress(data, codec, compressed, uncompressed)
                 decompressed = self.codecAD.getData()
-                # decompressed = blosc2.decompress(data)
+                # decompressed = blosc.decompress(data)
                 image = np.frombuffer(decompressed, dtype=np.float32).reshape((ny, nx))
 
             batch_list.append(image)
             frm_id_list.append(frameId)
 
-            outputFilePath = None
-            inputFilePath = None
+            filePath = None
             if self.outputDirectory is not None:
-                outputFilePath = os.path.join(self.outputDirectory, self.outputFileNameFormat)
-            if self.inputFileSaveDirectory is not None:
-                inputFilePath = os.path.join(self.inputFileSaveDirectory, self.inputFileNameFormat)
+                filePath = os.path.join(self.outputDirectory, self.outputFileNameFormat)
 
             while len(batch_list) >= bsz and not self.isDone:
                 batch_chunk = np.array(batch_list[:bsz]).astype(np.float32)
@@ -154,9 +142,7 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
                 frm_id_list = frm_id_list[bsz:]
 
                 t0 = time.time()
-                self.inferEngine.batch_infer(
-                    nx, ny, OUTPUT_NX, OUTPUT_NY, outputFilePath, inputFilePath, self.processorId
-                )
+                self.inferEngine.batch_infer(nx, ny, OUTPUT_NX, OUTPUT_NY, filePath, self.processorId)
 
                 t1 = time.time()
                 self.nBatchesProcessed += 1
@@ -189,15 +175,6 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
             self.outputDirectory = outputDirectory
         if "outputFileNameFormat" in configDict:
             self.outputFileNameFormat = configDict.get("outputFileNameFormat")
-        if "inputFileSaveDirectory" in configDict:
-            inputFileSaveDirectory = configDict.get("inputFileSaveDirectory")
-            self.logger.debug(f"Reconfigured input save directory: {inputFileSaveDirectory}")
-            if not os.path.exists(inputFileSaveDirectory):
-                self.logger.debug(f"Creating input save directory: {inputFileSaveDirectory}")
-                os.makedirs(inputFileSaveDirectory)
-            self.inputFileSaveDirectory = inputFileSaveDirectory
-        if "inputFileNameFormat" in configDict:
-            self.inputFileNameFormat = configDict.get("inputFileNameFormat")
 
     def process(self, pvObject):
         if self.isDone:
@@ -226,6 +203,15 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
 
     def getMetrics(self):
         m = {}
+        g_metric_command = "/usr/bin/nvidia-smi --query-gpu=memory.used,power.draw,utilization.gpu,utilization.memory --format=csv,noheader,nounits"
+        # we expect to get a csv looking like,
+        # b'877, 10.98, 0, 0\n'
+        g_metric_raw = subprocess.check_output(g_metric_command, shell=True).decode().strip()
+        sp = g_metric_raw.split(",")
+        m["gpuMemUsed"] = int(sp[0].strip())
+        m["gpuPowerWUsed"] = float(sp[1].strip())
+        m["gpuUtil"] = int(sp[2].strip())
+        m["gpuUtilMem"] = int(sp[3].strip())
         # according to https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
         # total used memory = RSS + CACHE + (SWAP)
         # we ingore SWAP as we don't expect to use it
@@ -289,6 +275,10 @@ class InferPtychoNNImageProcessor(AdImageProcessor):
     # Define PVA types for different stats variables
     def getStatsPvaTypes(self):
         return {
+            "gpuMemUsed": pva.UINT,
+            "gpuPowerWUsed": pva.FLOAT,
+            "gpuUtil": pva.UINT,
+            "gpuUtilMem": pva.UINT,
             "memUsed": pva.FLOAT,
             "cpuUtil": pva.FLOAT,
             "netTxUsed": pva.FLOAT,
